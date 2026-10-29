@@ -20,6 +20,7 @@ from .voice import install_voice
 from .version import RUNTIME_REVISION
 from .planning import pending_user_inputs
 from .evaluation import list_evaluations, get_evaluation
+from .reporting import compose_report
 
 settings = Settings.load()
 store = Store(settings.database, daily_call_limit=settings.daily_call_limit)
@@ -118,7 +119,7 @@ async def status():
     return {"service": "thinking-helper", "version": "0.1.0", "model": settings.model, "chat_model": settings.chat_model,
             "key_configured": bool(settings.api_key), "voice_configured": bool(settings.voice_id),
             "asr_model": settings.asr_model, "tts_model": settings.tts_model,
-            "usage": store.get_usage(), "limits": {"llm": settings.daily_call_limit,
+            "usage": store.get_usage(), "limits": {"chat": settings.chat_daily_call_limit, "llm": settings.daily_call_limit,
                         "tts": settings.tts_daily_chars, "asr": settings.asr_daily_seconds},
             "time": datetime.now(timezone.utc).isoformat(), "storage": "SQLite / durable jobs",
             "autonomous_code_editing": False, "scheduler_running": engine.running, "pid": os.getpid(),
@@ -262,7 +263,8 @@ async def observation(topic_id: str, request: Request):
 @app.post("/api/topics/{topic_id}/chat")
 async def chat(topic_id: str, data: ChatInput, request: Request):
     snapshot = store.get_topic(topic_id)
-    events = store.list_events(topic_id)
+    archive_events = store.list_events(topic_id, limit=None)
+    events = archive_events[:100]
     history = []
     invalid_reports = {e["data"].get("report_id"): e["data"].get("reason", "旧汇报已被复核为错误")
                        for e in events if e["kind"] == "interaction.report_review" and e["data"].get("valid") is False}
@@ -308,12 +310,14 @@ async def chat(topic_id: str, data: ChatInput, request: Request):
     live = {"jobs": [{"kind": j["kind"], "status": j["status"]} for j in store.list_jobs(topic_id)[:6]],
             "candidates": [{"summary": c.get("summary"), "status": c["status"], "kind": c["kind"],
                             "note": "方法建议不是已执行的代码变更" if c["kind"] == "selfupdate" else "仅applied已进入当前结构"}
-                           for c in candidates[:6]]}
+                           for c in candidates if c["status"] == "pending"][:6]}
     latest_changes = [{"summary": c.get("summary"), "base_version": c["base_version"],
-                       "applied_version": c.get("applied_version"), "reflection": c.get("reflection")}
-                      for c in candidates if c["status"] == "applied"][:3]
+                       "applied_version": c.get("applied_version")}
+                      for c in candidates if c["status"] == "applied" and c.get("applied_version") == snapshot["version"]][:1]
+    correction = next((e["data"] for e in archive_events if e["kind"] == "topic.corrected" and e["data"].get("version") == snapshot["version"]), None)
+    latest_change = correction or (latest_changes[0] if latest_changes else None)
     snapshot["document"] = {**snapshot["document"], "current_background": live, "latest_integrated_changes": latest_changes,
-                            "pending_user_inputs": pending_user_inputs(events, candidates), "unheard_reports": unheard[-2:]}
+                            "pending_user_inputs": pending_user_inputs(archive_events, candidates), "unheard_reports": unheard[-2:]}
     report_id = uuid4().hex
 
     async def stream():
@@ -321,14 +325,26 @@ async def chat(topic_id: str, data: ChatInput, request: Request):
         def emit(event):
             return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
         try:
-            yield emit({"type": "start", "version": snapshot["version"], "report_id": report_id})
-            async for delta in provider.stream_chat(snapshot, data.text, history, report=data.report):
-                if await request.is_disconnected():
-                    break
-                content += delta
-                yield emit({"type": "delta", "text": delta})
+            yield emit({"type": "start", "version": snapshot["version"], "report_id": report_id,
+                        "mode": "structured_report" if data.report else "model"})
+            if data.report:
+                for paragraph in compose_report(snapshot, latest_change=latest_change,
+                            background={"paused": snapshot["paused"], "running": sum(j["status"] == "running" for j in store.list_jobs(topic_id)), "pending": sum(c["status"] == "pending" for c in candidates)}):
+                    if await request.is_disconnected():
+                        break
+                    delta = paragraph + "\n\n"
+                    content += delta
+                    yield emit({"type": "delta", "text": delta})
+                else:
+                    completed = True
             else:
-                completed = True
+                async for delta in provider.stream_chat(snapshot, data.text, history):
+                    if await request.is_disconnected():
+                        break
+                    content += delta
+                    yield emit({"type": "delta", "text": delta})
+                else:
+                    completed = True
             yield emit({"type": "done", "report_id": report_id})
         except asyncio.CancelledError:
             raise
@@ -338,6 +354,7 @@ async def chat(topic_id: str, data: ChatInput, request: Request):
             store.add_event(topic_id, "assistant_message", {"text": content, "complete": completed,
                             "version": snapshot["version"], "report_id": report_id,
                             "voice_mode": data.voice_mode, "runtime_revision": RUNTIME_REVISION,
+                            "generation_mode": "structured_report" if data.report else "model",
                             "note": "生成记录不代表已完整播放；见playback事件。"})
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 

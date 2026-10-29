@@ -3,12 +3,13 @@ import copy
 import json
 import tempfile
 import unittest
-import httpx
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from app.config import Settings
-from app.core import Store, LeaseLost
+from app.core import Store, LeaseLost, BudgetExceeded
 from app.providers import Provider
 
 
@@ -73,6 +74,17 @@ class ResearchQualityTests(unittest.IsolatedAsyncioTestCase):
                 await self.provider.research(self.topic, self.job)
         self.provider.completion.assert_not_awaited()
 
+    async def test_literal_english_sentence_is_not_rejected_only_for_exceeding_120_characters(self):
+        quote="Scheduled tasks run remotely, so they run on their cadence even when your computer is asleep or the Claude Desktop app is closed."
+        self.assertGreater(len(quote),120)
+        source={**self.source,"excerpt":quote,"verified_content":True}
+        claim={"id":"c-cloud","text":"Claude的定时任务可在电脑关闭后远端继续。","status":"supported","source_ids":["src-abc"],"question_ids":["q1"],"evidence_quotes":[{"source_id":"src-abc","quote":quote}]}
+        self.provider.completion=AsyncMock(return_value=self.result([claim]))
+        with patch("app.providers.fetch_evidence",AsyncMock(return_value={"sources":[source],"errors":[]})):
+            proposal=await self.provider.research(self.topic,self.job)
+        self.assertEqual(proposal["document"]["claims"],[claim])
+        self.assertIn("integration_attempt",self.store.get_job(self.job["id"])["payload"])
+
     async def test_citation_id_without_matching_original_quote_is_not_evidence(self):
         claim = {"id": "c1", "text": "本地调度无需常驻。", "status": "supported", "source_ids": ["src-abc"],
                  "question_ids": ["q1"], "evidence_quotes": [{"source_id": "src-abc", "quote": "A fabricated passage from the model."}]}
@@ -136,26 +148,6 @@ class ResearchQualityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(proposal["runtime_revision"])
 
 
-    async def test_oral_report_excludes_old_assistant_claims_and_speculative_plan(self):
-        topic = copy.deepcopy(self.topic)
-        topic["document"]["summary"] = "Letta已经接入"
-        topic["document"]["next_steps"] = ["修复尚未存在的MemFS同步"]
-        captured = {}
-        async def handler(request):
-            captured.update(json.loads(request.content))
-            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"只按真实状态汇报。"}}]}\n\ndata: [DONE]\n\n', headers={"Content-Type":"text/event-stream"})
-        original = httpx.AsyncClient
-        self.provider._reserve = lambda: None
-        with patch("app.providers.httpx.AsyncClient", side_effect=lambda **kw: original(transport=httpx.MockTransport(handler))):
-            result = [x async for x in self.provider.stream_chat(topic,"汇报",[{"role":"assistant","content":"旧错误：MemFS已部署"}],report=True)]
-        self.assertEqual(result,["只按真实状态汇报。"])
-        sent=json.dumps(captured,ensure_ascii=False)
-        self.assertNotIn("旧错误：MemFS已部署",sent)
-        self.assertNotIn("修复尚未存在的MemFS同步",sent)
-        self.assertNotIn("Letta已经接入",sent)
-        self.assertIn("外部调研对象",sent)
-
-
     async def test_growing_archive_does_not_resend_every_historical_page(self):
         topic=copy.deepcopy(self.topic)
         topic["sources"] += [{"id":f"s-{i}","url":f"https://docs.example.org/{i}","excerpt":"OLD_PAGE_ARCHIVE"*1000,"verified_content":True} for i in range(100)]
@@ -168,6 +160,82 @@ class ResearchQualityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("OLD_PAGE_ARCHIVE",sent)
         self.assertLess(len(sent),40000)
         self.assertIn("Cloud schedules run server-side",sent)
+
+
+class ProviderBudgetTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "state.db"
+        self.store = Store(self.path, daily_call_limit=2)
+        self.settings = Settings(api_key="test-key", daily_call_limit=2, chat_daily_call_limit=3)
+        self.provider = Provider(self.settings, self.store)
+        self.requests = []
+        client_class = httpx.AsyncClient
+        self.client_patch = patch("app.providers.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
+            transport=httpx.MockTransport(self.respond), **kwargs))
+        self.client_patch.start()
+
+    def tearDown(self):
+        self.client_patch.stop()
+        self.store.close()
+        self.temp.cleanup()
+
+    def respond(self, request):
+        payload = json.loads(request.content)
+        self.requests.append(payload)
+        if payload.get("stream"):
+            event = json.dumps({"choices": [{"delta": {"content": "继续聊"}}]}, ensure_ascii=False)
+            return httpx.Response(200, content=f"data: {event}\n\ndata: [DONE]\n\n".encode(),
+                                  headers={"Content-Type": "text/event-stream"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "研究结果"}}]})
+
+    async def chat(self):
+        return "".join([part async for part in self.provider.stream_chat({"document": {}}, "继续想想")])
+
+    async def background(self):
+        return await self.provider.completion([{"role": "user", "content": "查证问题"}])
+
+    async def test_chat_exhaustion_leaves_background_budget_available(self):
+        for _ in range(3):
+            self.assertEqual(await self.chat(), "继续聊")
+        with self.assertRaisesRegex(BudgetExceeded, "chat"):
+            await self.chat()
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(await self.background(), "研究结果")
+        usage = self.store.get_usage()
+        self.assertEqual(usage["chat"]["used"], 3)
+        self.assertEqual(usage["llm"]["used"], 1)
+        self.assertEqual([request["model"] for request in self.requests], ["qwen-flash"] * 3 + ["qwen-plus"])
+
+    async def test_background_exhaustion_leaves_chat_budget_available(self):
+        for _ in range(2):
+            self.assertEqual(await self.background(), "研究结果")
+        with self.assertRaisesRegex(BudgetExceeded, "llm"):
+            await self.background()
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(await self.chat(), "继续聊")
+        usage = self.store.get_usage()
+        self.assertEqual(usage["llm"]["used"], 2)
+        self.assertEqual(usage["chat"]["used"], 1)
+
+    async def test_reopened_store_does_not_raise_same_day_chat_limit(self):
+        self.settings.chat_daily_call_limit = 1
+        await self.chat()
+        self.store.close()
+        self.store = Store(self.path, daily_call_limit=2)
+        self.settings.chat_daily_call_limit = 120
+        self.provider = Provider(self.settings, self.store)
+        with self.assertRaisesRegex(BudgetExceeded, "chat.*1/1"):
+            await self.chat()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(await self.background(), "研究结果")
+        self.assertEqual(self.store.get_usage()["chat"]["limit"], 1)
+
+    async def test_chat_limit_default_and_environment(self):
+        self.assertEqual(Settings().chat_daily_call_limit, 120)
+        with patch.dict("os.environ", {"TH_CHAT_CALLS": "7", "TH_CREDENTIALS": str(Path(self.temp.name) / "absent.json"),
+                                       "DASHSCOPE_API_KEY": "test-key", "TH_VOICE_ID": "test-voice"}):
+            self.assertEqual(Settings.load().chat_daily_call_limit, 7)
 
 
 if __name__ == "__main__":

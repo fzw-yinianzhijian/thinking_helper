@@ -433,6 +433,42 @@ class Store:
                 conn.execute("UPDATE topics SET next_due_at=? WHERE id=?", (now + topic["interval_seconds"], topic["id"]))
         return queued
 
+    def schedule_reflections(self, *, now=None):
+        """Queue a bounded method review after three new terminal observations.
+
+        A trigger is not proof that reflection is useful. The normal worker,
+        provider budget and pending-candidate review rules still apply.
+        """
+        now = _timestamp(now)
+        queued = []
+        method_kinds = ("selfupdate", "self_update", "system_update")
+        with self._transaction() as conn:
+            rows = conn.execute("SELECT * FROM topics WHERE paused=0 ORDER BY created_at,id").fetchall()
+            for row in rows:
+                topic = self._topic(row)
+                active = conn.execute("SELECT 1 FROM jobs WHERE topic_id=? AND kind IN (?,?,?) AND status IN ('queued','running') LIMIT 1", (topic["id"], *method_kinds)).fetchone()
+                if active is not None:
+                    continue
+                pending = conn.execute("SELECT proposal_json FROM candidates WHERE topic_id=? AND kind IN (?,?,?) AND status='pending'", (topic["id"], *method_kinds)).fetchall()
+                if any(isinstance((change := json.loads(item["proposal_json"]).get("proposal")), dict) and bool(change) for item in pending):
+                    continue
+                last = conn.execute("SELECT MAX(created_at) AS created_at FROM jobs WHERE topic_id=? AND kind IN (?,?,?)", (topic["id"], *method_kinds)).fetchone()["created_at"]
+                if last is not None and now - last < 3 * 3600:
+                    continue
+                window_started_at = last if last is not None else 0
+                observations = conn.execute("""SELECT id,kind,status,updated_at FROM jobs
+                    WHERE topic_id=? AND kind IN ('research','organize')
+                      AND status IN ('completed','noop','failed') AND updated_at>? AND updated_at<=?
+                    ORDER BY updated_at,id""", (topic["id"], window_started_at, now)).fetchall()
+                if len(observations) < 3:
+                    continue
+                queued.append(self._enqueue(conn, topic, "selfupdate", now, {
+                    "trigger": "three_new_terminal_observations", "scheduled": True,
+                    "window_started_at": last,
+                    "observation_job_ids": [item["id"] for item in observations],
+                }, now))
+        return queued
+
     def get_job(self, job_id):
         with self._lock:
             return self._job(self._conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())

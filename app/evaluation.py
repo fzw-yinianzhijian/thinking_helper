@@ -24,6 +24,7 @@ CHECKS = {
     "core": "test_core.py",
     "planning": "test_product_scenarios.py",
     "provider": "test_provider.py",
+    "reporting": "test_reporting.py",
     "evidence": "test_evidence.py",
     "api": "test_api.py",
     "voice": "test_voice.py",

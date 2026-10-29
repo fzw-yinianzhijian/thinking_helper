@@ -229,6 +229,8 @@ def install_voice(app: FastAPI, settings: Any, reserve_usage: Callable) -> None:
             if data.get("type") not in {"text", "start"} or not isinstance(text, str) or not text.strip():
                 raise ValueError("请输入需要朗读的文本。")
             text = text.strip()
+            if not any(char.isalnum() for char in text):
+                raise ValueError("没有可朗读的文字，已跳过纯标点片段。")
             characters = weighted_characters(text)
             if characters > MAX_TTS_CHARACTERS:
                 raise ValueError("一次朗读最多 8000 计费字符。")

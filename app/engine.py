@@ -97,6 +97,7 @@ class Engine:
         """Schedule persisted due topics, then execute at most one bounded batch."""
         async with self._run_lock:
             self.store.schedule_due_topics()
+            self.store.schedule_reflections()
             jobs = []
             for _ in range(max(1, int(self._setting("concurrency", 1)))):
                 job = self.store.claim_job(

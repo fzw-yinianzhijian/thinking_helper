@@ -62,6 +62,7 @@ class APIContractTests(unittest.TestCase):
         t = self.make_topic()
         r = self.client.post(f"/api/topics/{t['id']}/chat", json={"text": "请汇报", "report": True})
         self.assertIn('"type": "delta"', r.text)
+        self.assertFalse(hasattr(main.provider,'received_history'), 'Default report must not call a generative provider')
         events = main.store.list_events(t["id"])
         answer = next(e for e in events if e["kind"] == "assistant_message")
         self.assertTrue(answer["data"]["complete"])

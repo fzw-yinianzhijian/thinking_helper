@@ -18,6 +18,7 @@ class Settings:
     asr_model: str = "fun-asr-realtime"
     asr_silence_ms: int = 1300
     daily_call_limit: int = 24
+    chat_daily_call_limit: int = 120
     tts_daily_chars: int = 12000
     asr_daily_seconds: int = 1800
     database: str = str(ROOT / "data" / "workspace.sqlite3")
@@ -45,6 +46,7 @@ class Settings:
             chat_model=os.environ.get("TH_CHAT_MODEL", "qwen-flash"),
             database=os.environ.get("TH_DATABASE", str(ROOT / "data/workspace.sqlite3")),
             daily_call_limit=int(os.environ.get("TH_DAILY_CALLS", "24")),
+            chat_daily_call_limit=int(os.environ.get("TH_CHAT_CALLS", "120")),
             tts_daily_chars=int(os.environ.get("TH_TTS_CHARS", "12000")),
             asr_daily_seconds=int(os.environ.get("TH_ASR_SECONDS", "1800")),
         )

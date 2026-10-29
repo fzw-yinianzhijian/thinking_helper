@@ -54,6 +54,19 @@ class ThinkingContinuityScenarios(unittest.TestCase):
         self.assertEqual([item["event_id"] for item in selected], [9, 10, 11])
         self.assertEqual([item["text"] for item in selected], ["原话 9", "原话 10", "原话 11"])
 
+    def test_explicit_audit_classifies_legacy_report_without_guessing_or_deleting_originals(self):
+        events = [
+            {"id": 1, "kind": "user_message", "data": {"text": "请汇报当前整体"}},
+            {"id": 2, "kind": "user_message", "data": {"text": "我想继续研究汇报形式这个问题"}},
+            {"id": 3, "kind": "user_message", "data": {"text": "请汇报，但没有人工标注不能猜测"}},
+            {"id": 4, "kind": "input.classified", "data": {"input_event_ids": [1, "3", True, -2], "classification": "report_request"}},
+            {"id": 5, "kind": "input.classified", "data": {"input_event_ids": [2], "classification": "unknown_future_class"}},
+        ]
+        original = copy.deepcopy(events)
+        selected = pending_user_inputs(list(reversed(events)), [])
+        self.assertEqual([item["event_id"] for item in selected], [2, 3])
+        self.assertEqual(events, original)
+
     def test_existing_sources_do_not_lock_out_an_unattempted_question(self):
         topic = workspace()
         events = [{"kind": "research.focus", "data": {"job_id": "first", "question_id": "q-runtime"}}]

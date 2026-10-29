@@ -138,6 +138,15 @@ class VoiceProtocolTests(unittest.TestCase):
         self.assertTrue(run["payload"]["parameters"]["heartbeat"])
         self.assertTrue(upstream.closed)
 
+    def test_punctuation_only_segment_never_spends_or_opens_cloud(self):
+        with patch("app.voice.connect") as cloud, self.client.websocket_connect("/ws/tts") as ws:
+            ws.send_json({"type": "text", "text": "」。；……"})
+            error=ws.receive_json()
+            self.assertEqual(error["type"],"error")
+            self.assertIn("纯标点",error["message"])
+        cloud.assert_not_called()
+        self.assertEqual(self.usage,[])
+
     def test_missing_voice_fails_before_reserving_or_connecting(self):
         self.settings.voice_id = ""
         with patch("app.voice.connect") as cloud, self.client.websocket_connect("/ws/tts") as ws:

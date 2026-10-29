@@ -20,7 +20,7 @@ const voice = new VoiceIO({silenceMs:1300,
   onFinal:text=>{
     if(!text?.trim())return;
     if(text===state.lastTranscript && Date.now()-state.lastTranscriptAt<2500)return;
-    state.lastTranscript=text;state.lastTranscriptAt=Date.now();$('chatText').value='';sendChat(text);
+    state.lastTranscript=text;state.lastTranscriptAt=Date.now();$('chatText').value='';const normalized=text.replace(/[，。！？\s]/g,'');sendChat(text,/^(请)?(向我|给我)?汇报(一下)?(整体|当前|整体与变化)?$/.test(normalized));
   },
   onSpeech:()=>{stopReply(false);},
   onBackchannel:text=>{if(state.id)post(`/api/topics/${state.id}/observation`,{kind:'backchannel',text}).catch(showError);},
@@ -32,7 +32,7 @@ const voice = new VoiceIO({silenceMs:1300,
   },
   onMetrics:value=>{
     if(value.firstPCM!=null){
-      $('latency').textContent=`TTS首包 ${Math.round(value.firstPCM)}ms · 出声为排程估计`;
+      if(!state.firstPlaybackRecorded)$('latency').textContent=`TTS首包 ${Math.round(value.firstPCM)}ms · 出声为排程估计`;
       if(!state.firstPlaybackRecorded && state.activeReportId && state.submitStartedAt){
         state.firstPlaybackRecorded=true;
         const total=Math.round((value.scheduledStartAt ?? performance.now()+25)-state.submitStartedAt);
@@ -57,7 +57,7 @@ function addMessage(role,text='') {
 }
 
 function queueSpeech(text,generation,reportId,topicId) {
-  if(!$('voiceEnabled').checked||!text.trim())return;
+  if(!$('voiceEnabled').checked||!/[\p{L}\p{N}]/u.test(text))return;
   const segmentId=`${reportId}:${++state.speechSequence}`;
   if(generation!==state.generation)return;
   // VoiceIO runs the current sentence and prefetches at most one next sentence.
@@ -144,10 +144,11 @@ function render(data) {
   $('topicTitle').textContent=t.title;$('topicGoal').textContent=t.goal;$('version').textContent=`版本 ${t.version}`;
   $('summary').textContent=doc.summary || '目前还没有全局判断。先自由表达，或让后台推进一个小问题。';
   const sources=new Map((t.sources||[]).map(x=>[x.id,x]));
-  $('claims').innerHTML=(doc.claims||[]).map(c=>`<article class="claim"><span class="tag">${esc(labels[c.status]||c.status)}</span><p>${esc(c.text)}</p>${(c.source_ids||[]).map(id=>sources.has(id)?safeLink(sources.get(id)):'').join(' ')}</article>`).join('')||'<p class="muted">尚未形成观点，允许想法暂时零散。</p>';
-  $('questions').innerHTML=(doc.questions||[]).map(q=>`<div class="question ${q.status==='resolved'?'resolved':''}">${esc(typeof q==='string'?q:q.text)}</div>`).join('')||'<p class="muted">还没有明确的问题分支。</p>';
-  $('nextSteps').innerHTML=(doc.next_steps||[]).map(x=>`<li>${esc(typeof x==='string'?x:x.text)}</li>`).join('')||'<li class="muted">等待下一次值得做的推进。</li>';
-  $('sources').innerHTML=(t.sources||[]).map(s=>`<div class="source">${safeLink(s)}<br><span class="muted">${esc(s.provenance||'外部资料')} · ${esc(s.retrieved_at||'')}</span></div>`).join('')||'<p class="muted">暂时没有外部来源。</p>';
+  $('claimCount').textContent=`（${doc.claims?.length||0}条）`;
+  stableHTML('claims',(doc.claims||[]).map(c=>`<article class="claim"><span class="tag">${esc(labels[c.status]||c.status)}</span><p>${esc(c.text)}</p>${(c.source_ids||[]).map(id=>sources.has(id)?safeLink(sources.get(id)):'').join(' ')}</article>`).join('')||'<p class="muted">尚未形成观点，允许想法暂时零散。</p>');
+  stableHTML('questions',(doc.questions||[]).map(q=>`<div class="question ${q.status==='resolved'?'resolved':''}">${esc(typeof q==='string'?q:q.text)}</div>`).join('')||'<p class="muted">还没有明确的问题分支。</p>');
+  stableHTML('nextSteps',(doc.next_steps||[]).map(x=>`<li>${esc(typeof x==='string'?x:x.text)}</li>`).join('')||'<li class="muted">等待下一次值得做的推进。</li>');
+  stableHTML('sources',(t.sources||[]).map(s=>`<div class="source">${safeLink(s)}<br><span class="muted">${esc(s.provenance||'外部资料')} · ${esc(s.retrieved_at||'')}</span></div>`).join('')||'<p class="muted">暂时没有外部来源。</p>');
   const running=data.jobs.find(j=>j.status==='running');
   $('backgroundStatus').textContent=t.paused?'后台已暂停':running?'正在后台推进':'后台持续待命';
   $('pauseBackground').textContent=t.paused?'恢复后台':'暂停后台';
@@ -156,12 +157,17 @@ function render(data) {
   $('inputInbox').hidden=!data.pending_inputs?.length;
   stableHTML('pendingInputs',(data.pending_inputs||[]).map(i=>`<div class="question">${esc(i.text)}</div>`).join(''));
   $('researchNow').disabled=t.paused||Boolean(running);$('reflectNow').disabled=t.paused;
-  stableHTML('candidates',data.candidates.slice(0,12).map(c=>{
+  const cards=data.candidates.slice(0,12).map(c=>{
     const p=c.proposal||c;const pending=c.status==='pending';const improvement=c.kind==='selfupdate';
     const reflection=typeof p.reflection==='string'?p.reflection:JSON.stringify(p.reflection||'');
-    return `<article class="update"><div class="meta">${esc(improvement?'工作方式复盘':'内容进展')} · ${esc(labels[c.status]||c.status)} · 基于版本 ${c.base_version} · ${date(c.created_at)}</div><h3>${esc(c.summary||p.summary||'本轮更新')}</h3><p>${esc(reflection)}</p>${p.review_reason?`<p class="review-note">${esc(p.review_reason)}</p>`:''}${improvement?`<p class="muted">建议模块：${esc(p.proposal?.module||'暂无')} · 评估：${esc(p.evaluation?.status||'未运行')} · 接受建议不会执行代码</p>`:changePreview(c,data)}<details><summary>查看候选内容与来源</summary><p>${esc(c.document?.summary||'方法改进建议，不会自动修改代码。')}</p>${(c.sources||[]).map(s=>safeLink(s)).join('<br>')}<pre>${esc(JSON.stringify(c.document||p.proposal||{},null,2))}</pre></details>${pending?`<button data-apply="${c.id}">${improvement?'接受建议（不执行代码）':'整合到当前结构'}</button><button data-reject="${c.id}">不采纳</button>`:''}</article>`;
-  }).join('')||'<p class="muted">还没有候选更新。你离开页面后，后台仍会按约定推进；回来查看发生了什么变化。</p>');
-  $('jobs').innerHTML=data.jobs.slice(0,15).map(j=>`<div class="job ${j.last_error?'error':''}"><div>${esc(j.kind==='selfupdate'?'方法复盘':'研究推进')} · ${esc(labels[j.status]||j.status)}<br><span class="muted">版本 ${j.base_version} · ${date(j.created_at)} ${esc(j.last_error||'')}</span></div>${['running','queued'].includes(j.status)?`<button data-cancel="${j.id}">取消任务</button>`:''}</div>`).join('');
+    return {status:c.status,html:`<article class="update"><div class="meta">${esc(improvement?'工作方式复盘':'内容进展')} · ${esc(labels[c.status]||c.status)} · 基于版本 ${c.base_version} · ${date(c.created_at)}</div><h3>${esc(String(c.summary||p.summary||'本轮更新').slice(0,180))}</h3><p>${esc(reflection.slice(0,200))}</p>${p.review_reason?`<p class="review-note">${esc(p.review_reason)}</p>`:''}${improvement?`<p class="muted">建议模块：${esc(p.proposal?.module||'暂无')} · 评估：${esc(p.evaluation?.status||'未运行')} · 接受建议不会执行代码</p>`:changePreview(c,data)}<details><summary>查看候选内容与来源</summary><p>${esc(c.document?.summary||'方法改进建议，不会自动修改代码。')}</p>${(c.sources||[]).map(s=>safeLink(s)).join('<br>')}<pre>${esc(JSON.stringify(c.document||p.proposal||{},null,2))}</pre></details>${pending?`<button data-apply="${c.id}">${improvement?'接受建议（不执行代码）':'整合到当前结构'}</button><button data-reject="${c.id}">不采纳</button>`:''}</article>`};
+  });
+  const pendingCards=cards.filter(c=>c.status==='pending').map(c=>c.html).join('');
+  const historyCards=cards.filter(c=>c.status!=='pending').map(c=>c.html).join('');
+  const change=data.events.find(e=>['topic.corrected','candidate.applied'].includes(e.kind));
+  const recent=change?`<p class="muted">最近结构更新 · v${t.version} · ${esc(String(change.data.note||'候选已整合，当前理解已更新。').slice(0,150))}</p>`:'';
+  stableHTML('candidates',recent+(pendingCards||'<p class="muted">当前没有待审阅更新。后台会继续按约定推进。</p>')+(historyCards?`<details><summary>历史、已整合与失败记录（${cards.length-cards.filter(c=>c.status==='pending').length}）</summary><p class="muted">以下保留当时的内容，不代表当前运行状态；当前版本见上方结构。</p>${historyCards}</details>`:''));
+  stableHTML('jobs',data.jobs.slice(0,15).map(j=>`<div class="job ${j.last_error?'error':''}"><div>${esc(j.kind==='selfupdate'?'方法复盘':j.kind==='organize'?'整理原话':'研究推进')} · ${esc(labels[j.status]||j.status)}<br><span class="muted">版本 ${j.base_version} · ${date(j.created_at)} ${esc(j.last_error||j.payload?.no_increment_reason||'')}</span></div>${['running','queued'].includes(j.status)?`<button data-cancel="${j.id}">取消任务</button>`:''}</div>`).join(''));
   stableHTML('evaluations',(data.evaluations||[]).map(e=>`<div class="job"><div>${esc({baseline_only:'基线已记录',checks_failed:'检查失败',checks_passed:'变更通过所列检查'}[e.status]||e.status)} · ${esc(e.checks?.join(' / '))}<br><span class="muted">${esc(e.runtime_revision)} · ${esc(e.reason)}</span></div></div>`).join('')||'<p class="muted">尚未运行方法变更检查。</p>');
   $('lastRefresh').textContent=`状态更新 ${new Date().toLocaleTimeString('zh-CN')}`;
 }
@@ -171,9 +177,9 @@ async function refresh() {
   const [topics,status]=await Promise.all([api('/api/topics'),api('/api/status')]);
   if(refreshSeq!==state.refreshSeq)return;
   $('serviceStatus').textContent=status.key_configured?'持久后台已连接':'工作区可用 · 模型待配置';
-  $('usage').textContent=`今日已预留：模型 ${status.usage.llm?.used||0}/${status.limits.llm} 次；语音合成 ${status.usage.tts?.used||0}/${status.limits.tts} 计费字符；识别 ${status.usage.asr?.used||0}/${status.limits.asr} 秒。上海时间次日重置。`;
+  $('usage').textContent=`今日已预留：交互 ${status.usage.chat?.used||0}/${status.limits.chat} 次；后台模型 ${status.usage.llm?.used||0}/${status.limits.llm} 次；语音合成 ${status.usage.tts?.used||0}/${status.limits.tts} 计费字符；识别 ${status.usage.asr?.used||0}/${status.limits.asr} 秒。上海时间次日重置。`;
   if(!topics.some(t=>t.id===state.id))state.id=topics[0]?.id||null;
-  $('topics').innerHTML=topics.map(t=>`<button class="topic-link ${t.id===state.id?'active':''}" data-topic="${t.id}">${esc(t.title)}<small>${t.paused?'已暂停':'持续推进'} · v${t.version}</small></button>`).join('');
+  stableHTML('topics',topics.map(t=>`<button class="topic-link ${t.id===state.id?'active':''}" data-topic="${t.id}">${esc(t.title)}<small>${t.paused?'已暂停':'持续推进'} · v${t.version}</small></button>`).join(''));
   if(state.id){const topicId=state.id;localStorage.setItem('thinking-topic',topicId);const detail=await api(`/api/topics/${topicId}`);if(refreshSeq===state.refreshSeq&&topicId===state.id)render(detail);}
 }
 

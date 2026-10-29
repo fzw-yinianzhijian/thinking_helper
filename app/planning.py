@@ -74,6 +74,17 @@ def pending_user_inputs(events, candidates, limit=8):
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise ValueError("limit must be a non-negative integer")
+    events = list(events)
+    classified_reports = set()
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") != "input.classified":
+            continue
+        data = event.get("data", {})
+        if not isinstance(data, dict) or data.get("classification") != "report_request":
+            continue
+        ids = data.get("input_event_ids")
+        if isinstance(ids, list):
+            classified_reports.update(value for value in ids if type(value) is int and value > 0)
     captured = set()
     for candidate in candidates:
         if not isinstance(candidate, dict) or candidate.get("status") not in {"pending", "applied"}:
@@ -89,7 +100,7 @@ def pending_user_inputs(events, candidates, limit=8):
         if not isinstance(data, dict) or data.get("report") is True:
             continue
         text, event_id = data.get("text"), _event_id(event.get("id"))
-        if event_id is None or event_id in captured or not isinstance(text, str) or not text.strip():
+        if event_id is None or event_id in captured or event_id in classified_reports or not isinstance(text, str) or not text.strip():
             continue
         available[event_id] = {"event_id": event_id, "text": text}
     if limit == 0:

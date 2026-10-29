@@ -7,6 +7,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from app.core import BudgetExceeded, LeaseLost, Store
 from app.engine import Engine
@@ -35,6 +36,76 @@ class StoreTests(unittest.TestCase):
         claimed = self.store.claim_job(owner)
         self.assertEqual(claimed["id"], job["id"])
         return claimed
+
+    def terminal_observation(self, kind, status, when):
+        with patch("app.core.time.time", return_value=when):
+            job = self.store.enqueue_job(self.topic["id"], kind)
+            claimed = self.store.claim_job("observation-worker")
+            self.assertEqual(claimed["id"], job["id"])
+            if status == "failed":
+                self.store.fail_job(job["id"], "observation-worker", "Observed bounded failure", max_attempts=1)
+            else:
+                value = proposal(f"Observation {kind} at {when}") if status == "completed" else {"document": self.store.get_topic(self.topic["id"])["document"], "sources": []}
+                self.store.finish_job(job["id"], "observation-worker", value)
+        self.assertEqual(self.store.get_job(job["id"])["status"], status)
+        return job["id"]
+
+    def test_reflection_requires_three_terminal_observations_not_cancellations_or_stale_work(self):
+        base = time.time() + 5
+        observed = [self.terminal_observation("research", "completed", base + 1),
+                    self.terminal_observation("organize", "noop", base + 2)]
+        with patch("app.core.time.time", return_value=base + 3):
+            cancelled = self.store.enqueue_job(self.topic["id"])
+            self.store.cancel_job(cancelled["id"])
+            obsolete = self.store.enqueue_job(self.topic["id"], "organize")
+            self.store.claim_job("old-work")
+            self.store.correct_topic(self.topic["id"], {"summary": "User correction"})
+            self.store.finish_job(obsolete["id"], "old-work", proposal("Late result"))
+        self.assertEqual(self.store.schedule_reflections(now=base + 4), [])
+        observed.append(self.terminal_observation("organize", "failed", base + 5))
+        scheduled = self.store.schedule_reflections(now=base + 6)
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0]["kind"], "selfupdate")
+        self.assertEqual(set(scheduled[0]["payload"]["observation_job_ids"]), set(observed))
+
+    def test_reflection_scheduling_is_exclusive_across_connections(self):
+        base = time.time() + 5
+        for offset in range(3):
+            self.terminal_observation("research", "noop", base + offset)
+        other = Store(self.path)
+        barrier = threading.Barrier(2)
+        def schedule(store):
+            barrier.wait()
+            return store.schedule_reflections(now=base + 5)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(schedule, store) for store in (self.store, other)]
+                self.assertEqual(sum(len(future.result()) for future in futures), 1)
+            self.assertEqual(len([job for job in self.store.list_jobs() if job["kind"] == "selfupdate"]), 1)
+        finally:
+            other.close()
+
+    def test_reflection_cooldown_and_pending_proposal_block_but_empty_proposal_does_not(self):
+        base = time.time() + 5
+        for offset in range(3):
+            self.terminal_observation("research", "noop", base + offset)
+        first = self.store.schedule_reflections(now=base + 10)[0]
+        self.store.claim_job("method-review", now=base + 10)
+        candidate = self.store.finish_job(first["id"], "method-review", {"summary": "Review repeated noops", "proposal": {"module": "background", "change": "Compare the next selected question"}}, now=base + 11)
+        for offset in range(3):
+            self.terminal_observation("organize", "noop", base + 20 + offset)
+        # Even after the three-hour cooldown, an actual pending proposal blocks.
+        self.assertEqual(self.store.schedule_reflections(now=base + 10811), [])
+        self.store.reject_candidate(candidate["id"], "Keep observing")
+        # Removing the pending proposal does not bypass the cooldown.
+        self.assertEqual(self.store.schedule_reflections(now=base + 30), [])
+        second = self.store.schedule_reflections(now=base + 10811)[0]
+        self.store.claim_job("empty-review", now=base + 10811)
+        self.store.finish_job(second["id"], "empty-review", {"summary": "Not enough evidence", "proposal": None}, now=base + 10812)
+        for offset in range(3):
+            self.terminal_observation("research", "noop", base + 10820 + offset)
+        self.assertEqual(self.store.schedule_reflections(now=base + 10830), [])
+        self.assertEqual(len(self.store.schedule_reflections(now=base + 21612)), 1)
 
     def test_default_review_and_idempotent_apply(self):
         job = self.claimed()
