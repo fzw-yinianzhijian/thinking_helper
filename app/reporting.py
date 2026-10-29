@@ -76,14 +76,14 @@ def compose_report(topic, *, latest_change=None, background=None):
     document = document if isinstance(document, dict) else {}
     summary = _text(document.get("summary"))
     if summary:
-        first = _line("当前笔记概况：", "概况节选：", summary, 60)
+        first = _line("当前笔记概况：", "概况节选：", summary, 40)
     elif _text(topic.get("title")):
-        first = _line("当前问题：", "问题标题节选：", topic["title"], 60)
+        first = _line("当前问题：", "问题标题节选：", topic["title"], 40)
     else:
         first = "当前没有标题或概述记录。"
     change = _change(topic, latest_change)
     if change:
-        second = _line("本版变化记录：", "变化记录节选：", change, 60)
+        second = _line("本版变化记录：", "变化记录节选：", change, 80)
     else:
         second = "当前版本没有新的整合记录。"
 
@@ -116,4 +116,4 @@ def compose_report(topic, *, latest_change=None, background=None):
     else:
         third = "尚无下一步或开放问题记录。" + status
     paragraphs = [first, second, third]
-    return [_excerpt(paragraph, limit)[0] for paragraph, limit in zip(paragraphs, (60, 60, 80))]
+    return [_excerpt(paragraph, limit)[0] for paragraph, limit in zip(paragraphs, (40, 80, 80))]
