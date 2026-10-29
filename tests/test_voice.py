@@ -293,6 +293,115 @@ await voice.close(); await delayed.close();
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node is only an optional browser-state test runtime")
+    def test_browser_frozen_audio_clock_cancels_without_completed_playback(self):
+        if int(subprocess.check_output(["node", "--version"], text=True).strip().lstrip("v").split(".")[0]) < 18:
+            self.skipTest("Browser-state harness needs Node >=18")
+        script = r'''
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const sockets = [], nodes = [], errors = [], intervals = new Map();
+let wallTime = 0, timerId = 0;
+Object.defineProperty(globalThis, 'performance', {value: {now: () => wallTime}});
+globalThis.setInterval = callback => {intervals.set(++timerId, callback); return timerId;};
+globalThis.clearInterval = id => intervals.delete(id);
+class Audio {
+  state = 'running'; currentTime = 0.005333; destination = {};
+  createBuffer(channels, length, rate) {
+    return {duration: length / rate, getChannelData: () => new Float32Array(length)};
+  }
+  createBufferSource() {
+    const node = {connect() {}, disconnect() {}, start(at) {this.at = at;}, stop() {this.stopped = true;}};
+    nodes.push(node); return node;
+  }
+  async close() {this.state = 'closed';}
+}
+class Socket {
+  static OPEN = 1; readyState = 0; sent = [];
+  constructor() {sockets.push(this); queueMicrotask(() => {
+    if (this.readyState === 3) return; this.readyState = 1; this.onopen?.();
+  });}
+  send(raw) {this.sent.push(JSON.parse(raw));}
+  pcm() {this.onmessage?.({data: new Int16Array(24000).buffer});}
+  done() {this.onmessage?.({data: JSON.stringify({type: 'done'})});}
+  close() {this.readyState = 3;}
+}
+globalThis.window = {location: {href: 'http://localhost:8890'}, AudioContext: Audio};
+globalThis.WebSocket = Socket;
+const {VoiceIO} = await import('data:text/javascript;base64,' + Buffer.from(fs.readFileSync('app/static/voice.js', 'utf8')).toString('base64'));
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const advance = async (milliseconds, context = null) => {
+  for (let elapsed = 0; elapsed < milliseconds; elapsed += 250) {
+    wallTime += 250;
+    if (context) context.currentTime += 0.25;
+    for (const callback of [...intervals.values()]) callback();
+    await tick();
+  }
+};
+
+const voice = new VoiceIO({onError: error => errors.push(error)});
+const first = voice.enqueue('当前句'), second = voice.enqueue('预取句'), third = voice.enqueue('尚未合成');
+let settled = false;
+first.then(() => {settled = true;}, () => {settled = true;});
+await tick();
+await advance(5000);
+assert.equal(intervals.size, 0, 'waiting for the first PCM is not a frozen playback clock');
+assert.equal(errors.length, 0);
+const current = sockets[0], lookahead = sockets[1];
+current.pcm(); current.done(); lookahead.pcm(); lookahead.done();
+assert.equal(intervals.size, 1);
+assert.equal(nodes.length, 1, 'prefetch never starts its own playback watchdog');
+await advance(3750);
+assert.equal(settled, false, 'the watchdog allows a full four-second observation window');
+await advance(250);
+await assert.rejects(first, /音频输出卡住/);
+assert.equal(errors.length, 1);
+assert.equal(voice.isSpeaking, false);
+assert.equal(voice.sources.size, 0);
+assert.equal(nodes[0].stopped, true);
+assert.equal(intervals.size, 0);
+assert.equal(current.readyState, 3); assert.equal(lookahead.readyState, 3);
+assert.equal(current.sent.at(-1).type, 'cancel');
+assert.equal(lookahead.sent.at(-1).type, 'cancel');
+assert.equal(voice.metrics.playedMs, 0, 'a timeout is never converted into estimated played time');
+assert.equal(voice.metrics.scheduledMs, 1000);
+assert.equal((await second).cancelled, true);
+assert.equal((await third).cancelled, true);
+assert.equal(sockets.length, 2, 'unsynthesized queue entries are cancelled without cloud work');
+await voice.close();
+
+// Long synthesis gaps, a progressing clock, and explicit suspension are not
+// the failure above. A later user interrupt must still clear this watchdog.
+const healthy = new VoiceIO({onError: error => errors.push(error)});
+const report = healthy.enqueue('慢合成与暂停');
+await tick();
+const active = sockets.at(-1);
+await advance(5000);
+active.pcm();
+await advance(1500, healthy.context);
+nodes.at(-1).onended();
+await advance(5000);
+assert.equal(errors.length, 1, 'a slow next chunk with no pending playback must not fail');
+active.pcm();
+await advance(3000);
+healthy.context.state = 'suspended';
+await advance(6000);
+assert.equal(errors.length, 1, 'an explicitly suspended output is not a broken running clock');
+healthy.context.state = 'running';
+await advance(3750);
+assert.equal(errors.length, 1, 'resuming gets a fresh observation window');
+await advance(1000, healthy.context);
+healthy.interrupt();
+assert.equal((await report).cancelled, true);
+assert.equal(intervals.size, 0, 'manual interruption releases the watchdog');
+await advance(5000);
+assert.equal(errors.length, 1);
+await healthy.close();
+'''
+        result = subprocess.run(["node", "--input-type=module", "-"], input=script, text=True,
+                                cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is only an optional browser-state test runtime")
     def test_browser_turn_gate_keeps_questions_and_filters_only_final_backchannels(self):
         if int(subprocess.check_output(["node", "--version"], text=True).strip().lstrip("v").split(".")[0]) < 18:
             self.skipTest("Browser-state harness needs Node >=18")

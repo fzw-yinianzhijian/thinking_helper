@@ -470,6 +470,10 @@ export class VoiceIO {
       let generationDone = false;
       let sampleRate = 24000;
       let sawAudio = false;
+      let clockTimer = null;
+      let lastClockValue = context.currentTime;
+      let lastClockAdvanceAt = performance.now();
+      let lastClockCheckAt = lastClockAdvanceAt;
       const playbackRanges = [];
       const playbackProgress = () => {
         const now = context.currentTime;
@@ -490,6 +494,7 @@ export class VoiceIO {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearInterval(clockTimer);
         if (this.activeTTS === source) {this.activeTTS = null; this.ttsSocket = null;}
         if (generation === this.speechGeneration) this.currentSpeechText = '';
         if (this.finishSpeaking === cancel) this.finishSpeaking = null;
@@ -509,6 +514,24 @@ export class VoiceIO {
       };
       const maybeFinish = () => {
         if (generationDone && this.sources.size === 0) finish({cancelled: false, ...this.metrics});
+      };
+      const checkAudioClock = () => {
+        if (settled || generation !== this.speechGeneration) return;
+        const now = performance.now();
+        const audioTime = context.currentTime;
+        const checkGap = now - lastClockCheckAt;
+        lastClockCheckAt = now;
+        // Observe only pending playback, not synthesis/network waits. Explicit
+        // suspension and a throttled timer gap restart the observation window.
+        if (context.state !== 'running' || this.sources.size === 0 || checkGap > 1000
+            || Math.abs(audioTime - lastClockValue) > 0.000001) {
+          lastClockValue = audioTime;
+          lastClockAdvanceAt = now;
+          return;
+        }
+        if (now - lastClockAdvanceAt >= 4000) {
+          fail(new Error('浏览器音频输出卡住，朗读已停止；请检查声音输出或换用浏览器后重试。'));
+        }
       };
       this.finishSpeaking = cancel;
       source.attach(event => {
@@ -549,6 +572,11 @@ export class VoiceIO {
             this.emit('onMetrics', {...this.metrics, playbackMeasurement: 'scheduled Web Audio output'});
           }
           node.start(playAt);
+          if (clockTimer === null) {
+            lastClockValue = context.currentTime;
+            lastClockAdvanceAt = lastClockCheckAt = performance.now();
+            clockTimer = setInterval(checkAudioClock, 250);
+          }
           return;
         }
         let data;
