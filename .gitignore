@@ -1,0 +1,10 @@
+.venv/
+.runtime/
+data/
+__pycache__/
+*.pyc
+.env
+*.log
+.DS_Store
+output/
+.playwright-cli/
